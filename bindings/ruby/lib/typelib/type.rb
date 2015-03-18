@@ -35,6 +35,22 @@ module Typelib
 
             attr_predicate :contains_converted_types?, true
 
+            # Returns whether one needs to call Typelib.to_ruby to convert this
+            # type to the type expected by the caller
+            #
+            # @return [Boolean]
+            def needs_convertion_to_ruby?
+                convertion_to_ruby && !convertion_to_ruby[1][:builtin]
+            end
+
+            # Returns whether one needs to call Typelib.from_ruby to convert a
+            # value given to the API to something this type can understand
+            #
+            # @return [Boolean]
+            def needs_convertion_from_ruby?
+                !convertions_from_ruby.empty?
+            end
+
             def compatible_with_memcpy?
                 layout = begin memory_layout
                          rescue
@@ -51,6 +67,51 @@ module Typelib
             def define_method_if_possible(name, &block)
                 Typelib.define_method_if_possible(self, self, name, Type::ALLOWED_OVERLOADINGS, &block)
             end
+
+            # Returns the description of a type using only simple ruby objects
+            # (Hash, Array, Numeric and String).
+            #
+            # The exact set of returned values is dependent on the exact type.
+            # See the documentation of {to_h} on the subclasses of Type for more
+            # details
+            #
+            # Some fields are always present, see {to_h_minimal}
+            #
+            # @option options [Boolean] :recursive (false) if true, the value
+            #   returned by types that refer to other types (e.g. an array) will
+            #   contain the reference's full definition. Otherwise, only the
+            #   value returned by {to_h_minimal} will be stored in the
+            #   type's description
+            # @option options [Boolean] :layout_info (false) if true, add binary
+            #   layout information from the type
+            #
+            # @return [Hash]
+            def to_h(options = Hash.new)
+                to_h_minimal(options)
+            end
+
+            # Returns the minimal description of a type using only simple ruby
+            # objects (Hash, Array, Numeric and String).
+            #
+            #    { 'name' => TypeName,
+            #      'class' => NameOfTypeClass, # CompoundType, ...
+            #      'size' => SizeOfTypeInBytes # Only if :layout_info is true
+            #    }
+            #
+            # It is mainly used as a helper by sub-types {to_h} method when
+            # :recursive is false
+            #
+            # @option options [Boolean] :layout_info (false) if true, add binary
+            #   layout information from the type
+            #
+            # @return [Hash]
+            def to_h_minimal(options = Hash.new)
+                result = Hash[name: name, class: superclass.name]
+                if options[:layout_info]
+                    result[:size] = size
+                end
+                result
+            end
         end
         @convertions_from_ruby = Hash.new
 
@@ -63,7 +124,7 @@ module Typelib
 
         # @deprecated
         #
-        # Replaced by {recursive_dependencies}
+        # Replaced by {direct_dependencies}
         def self.dependencies
             direct_dependencies
         end
@@ -100,15 +161,21 @@ module Typelib
         # given block on C++/Ruby bondary
         def self.convert_to_ruby(to = nil, options = Hash.new, &block)
             options = Kernel.validate_options options,
-                :recursive => true
+                recursive: true,
+                builtin: false
 
-            block = lambda(&block)
-            m = Module.new do
-		define_method(:to_ruby, &block)
+            if !options[:builtin] && !block
+                raise ArgumentError, "not a builtin conversion and no block given"
             end
-            extend(m)
 
-            options[:block] = block
+            if block
+                block = lambda(&block)
+                m = Module.new do
+                    define_method(:to_ruby, &block)
+                end
+                extend(m)
+                options[:block] = block
+            end
 
             self.contains_converted_types = options[:recursive]
             self.convertion_to_ruby = [to, options]
@@ -238,14 +305,14 @@ module Typelib
             end
         end
 
-        # Computes the paths that will allow to enumerate all containers
-        # contained in values of this type
+        # Computes the paths that will enumerate all cached containers contained
+        # in values of this type
         #
         # It is mostly useful in Type#handle_invalidation
         # 
         # @return [Accessor]
         def self.containers_accessor
-            @containers ||= Accessor.find_in_type(self) do |t|
+            @containers ||= Accessor.find_in_type(self, :raw_get_cached, :raw_each_cached) do |t|
                 t <= Typelib::ContainerType
             end
         end
@@ -369,7 +436,7 @@ module Typelib
             #
             # will return the C++ name for the given type
 	    def full_name(separator = Typelib::NAMESPACE_SEPARATOR, remove_leading = false)
-		result = namespace(separator, remove_leading) + basename(separator)
+		namespace(separator, remove_leading) + basename(separator)
 	    end
 
 	    def to_s; "#<#{superclass.name}: #{name}>" end
@@ -511,9 +578,6 @@ module Typelib
                     Typelib.from_ruby(init, self)
                 else
                     new_value = value_new
-                    if size = new_value.marshalling_size
-                        Typelib.add_allocated_memory(size)
-                    end
                     new_value.send(:initialize)
                     new_value
                 end
@@ -650,9 +714,13 @@ module Typelib
 	    elsif ! (ruby_value = to_ruby).eql?(self)
 		ruby_value.to_s
 	    else
-		"#<#{self.class.name}: 0x#{address.to_s(16)} ptr=0x#{@ptr.zone_address.to_s(16)}>"
+                raw_to_s
 	    end
 	end
+
+        def raw_to_s
+            "#<#{self.class.name}: 0x#{address.to_s(16)} ptr=0x#{@ptr.zone_address.to_s(16)}>"
+        end
 
 	def pretty_print(pp) # :nodoc:
 	    pp.text to_s
@@ -667,6 +735,38 @@ module Typelib
 
         def inspect
             sprintf("#<%s:%s @%s>", self.class.superclass.name, self.class.name, to_memory_ptr.inspect)
+        end
+
+        # Returns a representation of this type only into simple Ruby values,
+        # that is strings, numbers and arrays / hashes.
+        #
+        # @option options [Boolean] :special_float_values () if :string, the
+        #   floating point special values NaN and Infinity are converted to
+        #   strings. If :nil, they are converted to nil. Otherwise, they are
+        #   left as-is. This is required for marshalling formats that can't
+        #   represent them.
+        # @option options [Boolean] :pack_simple_arrays (true) if true, arrays
+        #   and containers of numeric types will be packed into a hash of the form
+        #   {size: size_in_elements, pack_code: code, data: packed_data}. The
+        #   pack_code field describes the type of element in the array (from
+        #   String#unpack or Array#pack), which tells both the type of the data
+        #   and its endianness.
+        #
+        # @return [Object]
+        def to_simple_value(options = Hash.new)
+            raise NotImplementedError, "there is no way to convert a value of type #{self.class} into a simple ruby value"
+        end
+
+        # Returns a representation of this type that can be serialized with JSON
+        #
+        # This is calling to_simple_value with the :special_float_values option
+        # set to :nil by default, as JSON cannot represent NaN and Infinity and
+        # converting those to null is the behaviour specified in the JSON
+        # documentation.
+        # 
+        # (see Type#to_simple_value)
+        def to_json_value(options = Hash.new)
+            to_simple_value(Hash[:special_float_values => :nil].merge(options))
         end
     end
 end
