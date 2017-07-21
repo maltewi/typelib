@@ -951,6 +951,12 @@ module Typelib
                 end
             end
 
+            if cflags = (options[:cflags])
+                cflags.each do |str|
+                    cmdline << "#{str}"
+                end
+            end
+
             required_files.map do |file|
                 Tempfile.open('typelib_gccxml') do |io|
                     if !system(*cmdline, '-o', io.path, file)
